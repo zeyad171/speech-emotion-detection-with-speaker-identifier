@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import LabelEncoder
+from typing import Optional
 from sklearn.model_selection import train_test_split
 import os
 import time
@@ -22,6 +23,8 @@ from src.feature_extraction import FeatureExtractor
 from src.evaluation import ModelEvaluator
 from src.utils import save_preprocessed_audio, load_preprocessed_audio
 from src.models.speaker_ml import extract_speaker_id_from_filename
+from src.models.dl_param_config import DLParamConfig
+from src.models.dl_param_config import DLParamConfig
 
 # --- 1. CONFIGURATION & HARDWARE ---
 
@@ -160,15 +163,64 @@ class SpeakerRNNModel(nn.Module):
 class SpeakerDLTrainer:
     """Train and evaluate deep learning models for speaker identification."""
     
-    def __init__(self, models_dir: str = 'models'):
+    def __init__(self, models_dir: str = 'models', cfg: Optional[DLParamConfig] = None):
         self.models_dir = models_dir
         os.makedirs(models_dir, exist_ok=True)
-        
+
         self.label_encoder = LabelEncoder()
         self.trained_models = {}
         self.model_configs = {} # Store dimensions here
         self.device = _device
         self.gpu_available = _GPU_AVAILABLE
+        self.cfg = cfg or DLParamConfig()
+
+    def save_metadata(self, metadata: dict, filename: str = 'speaker_dl_metadata.json') -> str:
+        """Persist speaker DL training metadata (models, speakers, config) as JSON.
+
+        Args:
+            metadata: Dictionary with structured metadata.
+            filename: Output JSON filename inside models_dir.
+        Returns:
+            Path to saved metadata file.
+        """
+        import json
+        out_path = os.path.join(self.models_dir, filename)
+        # Convert any numpy types to native python
+        def _convert(o):
+            import numpy as np
+            if isinstance(o, np.ndarray):
+                return o.tolist()
+            if isinstance(o, (np.integer, np.floating)):
+                return o.item()
+            return o
+        serializable = {}
+        for k, v in metadata.items():
+            if isinstance(v, dict):
+                serializable[k] = {sk: _convert(sv) for sk, sv in v.items()}
+            else:
+                serializable[k] = _convert(v)
+        try:
+            with open(out_path, 'w') as f:
+                json.dump(serializable, f, indent=2)
+            print(f"Saved speaker DL metadata to {out_path}")
+        except Exception as e:
+            print(f"[WARNING] Could not save speaker DL metadata: {e}")
+        return out_path
+
+    def _freeze_backbone_head_only(self, model: nn.Module) -> None:
+        """
+        Freeze all parameters except those likely to be classifier/head layers.
+        Heuristic: parameter names containing 'fc' or 'classifier' are treated as head.
+        """
+        for name, param in model.named_parameters():
+            if 'fc' in name or 'classifier' in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+
+    def _unfreeze_all(self, model: nn.Module) -> None:
+        for param in model.parameters():
+            param.requires_grad = True
     
     def prepare_spectrograms(self, audio_list, extractor, target_shape=(128, 128)):
         """Prepare mel spectrograms for CNN models (Padding/Cropping instead of Resizing)."""
@@ -275,10 +327,35 @@ class SpeakerDLTrainer:
             if model_device.type != 'cpu':
                 print(f"  [WARNING] Model device mismatch! Expected CPU, got {model_device}")
         
-        # Setup Training
+        # Setup Training with per-model finetune overrides
         criterion = nn.CrossEntropyLoss()
-        optimizer = optim.Adam(model.parameters(), lr=0.001)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+        cfg = self.cfg
+        wd = getattr(cfg, 'weight_decay', 0.0)
+
+        model_key = model_type.lower()
+        model_finetune = {}
+        if hasattr(cfg, f"{model_key}_finetune"):
+            model_finetune = getattr(cfg, f"{model_key}_finetune") or {}
+
+        freeze_flag = model_finetune.get('freeze_backbone', getattr(cfg, 'freeze_backbone', False))
+        head_epochs = int(model_finetune.get('finetune_head_epochs', getattr(cfg, 'finetune_head_epochs', 0))) if freeze_flag else 0
+        head_lr = model_finetune.get('head_lr', getattr(cfg, 'head_lr', getattr(cfg, 'learning_rate', 0.001)))
+        full_phase_lr = model_finetune.get('full_finetune_lr', getattr(cfg, 'full_finetune_lr', getattr(cfg, 'learning_rate', 0.001)))
+
+        # If head-phase configured, freeze backbone otherwise unfreeze all
+        if head_epochs > 0:
+            self._freeze_backbone_head_only(model)
+            initial_lr = head_lr
+        else:
+            self._unfreeze_all(model)
+            initial_lr = getattr(cfg, 'learning_rate', 0.001)
+
+        if getattr(cfg, 'optimizer', 'adamw').lower().startswith('adamw'):
+            optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=initial_lr, weight_decay=wd)
+        else:
+            optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=initial_lr)
+
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=getattr(cfg, 'scheduler_patience', 5))
         
         # Use new torch.amp.GradScaler
         scaler = torch.amp.GradScaler('cuda') if self.gpu_available else None
@@ -317,6 +394,16 @@ class SpeakerDLTrainer:
         epoch_start_time = None
         
         for epoch in range(epochs):
+            # Switch from head-phase to full-phase if configured
+            if head_epochs > 0 and epoch == head_epochs:
+                # Unfreeze whole model and recreate optimizer with full-phase LR
+                self._unfreeze_all(model)
+                if getattr(cfg, 'optimizer', 'adamw').lower().startswith('adamw'):
+                    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=full_phase_lr, weight_decay=wd)
+                else:
+                    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=full_phase_lr)
+                scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=getattr(cfg, 'scheduler_patience', 5))
+
             if epoch == 0:
                 epoch_start_time = time.time()
             
@@ -611,7 +698,7 @@ class SpeakerDLTrainer:
         
         return predictions_decoded, probabilities
 
-def train(models_dir='models', test_size=0.2, validation_size=0.1, random_state=42, epochs=100, batch_size=256):
+def train(models_dir='models', test_size=0.2, validation_size=0.1, random_state=42, epochs: int = None, batch_size: int = None, cfg: DLParamConfig = None):
     """
     Complete training pipeline for speaker identification DL models.
     
@@ -628,6 +715,14 @@ def train(models_dir='models', test_size=0.2, validation_size=0.1, random_state=
     print("="*60)
     
     os.makedirs(models_dir, exist_ok=True)
+
+    # Configuration: prefer explicit args, otherwise use cfg defaults
+    if cfg is None:
+        cfg = DLParamConfig()
+    if epochs is None:
+        epochs = cfg.epochs
+    if batch_size is None:
+        batch_size = cfg.batch_size
     
     # Load datasets
     print("\n[1/6] Loading datasets and extracting speaker IDs...")
@@ -903,6 +998,43 @@ def train(models_dir='models', test_size=0.2, validation_size=0.1, random_state=
     print(f"{'='*60}")
     print(f"Best model: {best_model} (Accuracy: {best_score:.4f})")
     print(f"{'='*60}")
+    # Save used config for reproducibility
+    try:
+        cfg.save(os.path.join(models_dir, 'dl_config_speaker.json'))
+        print(f"Saved DL config to {os.path.join(models_dir, 'dl_config_speaker.json')}")
+    except Exception:
+        pass
+
+    # Build and save metadata (speaker mapping, models, config summary)
+    try:
+        # Speaker mapping index -> label
+        speaker_mapping = {int(i): lbl for i, lbl in enumerate(dl_trainer.label_encoder.classes_)}
+        model_file_paths = {mt: f"speaker_{mt}.pth" for mt in available_models}
+        finetune_blocks = {}
+        for key in ['cnn_finetune', 'lstm_finetune', 'rnn_finetune']:
+            if hasattr(cfg, key):
+                finetune_blocks[key] = getattr(cfg, key)
+        metadata = {
+            'timestamp': __import__('datetime').datetime.utcnow().isoformat() + 'Z',
+            'models_dir': models_dir,
+            'model_types_trained': available_models,
+            'best_model': best_model,
+            'best_model_accuracy': best_score,
+            'speaker_count': len(speaker_mapping),
+            'speaker_mapping': speaker_mapping,
+            'model_file_paths': model_file_paths,
+            'epochs': epochs,
+            'batch_size': batch_size,
+            'test_size': test_size,
+            'validation_size': validation_size,
+            'random_state': random_state,
+            'config_overrides': {k: getattr(cfg, k) for k in ['learning_rate', 'weight_decay', 'optimizer', 'scheduler_patience'] if hasattr(cfg, k)},
+            'finetune': finetune_blocks,
+            'model_configs': dl_trainer.model_configs
+        }
+        dl_trainer.save_metadata(metadata)
+    except Exception as e:
+        print(f"[WARNING] Failed to generate speaker DL metadata: {e}")
 
 
 if __name__ == '__main__':

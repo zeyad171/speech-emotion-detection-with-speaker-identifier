@@ -1,0 +1,17 @@
+{
+  "logistic_regression": {
+    "C": 1.0,
+    "max_iter": 1000
+  },
+  "random_forest": {
+    "n_estimators": 200,
+    "min_samples_split": 2,
+    "min_samples_leaf": 1,
+    "max_depth": 20
+  },
+  "svm": {
+    "kernel": "rbf",
+    "gamma": "scale",
+    "C": 10.0
+  }
+}

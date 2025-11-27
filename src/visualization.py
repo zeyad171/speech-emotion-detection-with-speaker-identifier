@@ -4,9 +4,14 @@ Visualization helper functions for speaker comparison and analysis.
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 import json
 import os
+import seaborn as sns
+
+# Optional sklearn helpers used for calibration and embedding visualization
+from sklearn.calibration import calibration_curve
+from sklearn.manifold import TSNE
 
 
 def plot_speaker_probabilities(speaker_probs: Dict[str, float], 
@@ -253,21 +258,82 @@ def get_top_k_similar_speakers(query_features: np.ndarray,
     return similarities[:k]
 
 
-def load_speaker_metadata(metadata_file: str = 'models/speaker_metadata.json') -> Dict:
-    """
-    Load speaker metadata from JSON file.
-    
-    Args:
-        metadata_file: Path to metadata file
-        
+def load_speaker_metadata(metadata_file: str = 'models/speaker_metadata.json',
+                          dl_metadata_file: str = 'models/speaker_dl_metadata.json',
+                          ml_metadata_pkl: str = 'models/speaker_models_metadata.pkl') -> Dict:
+    """Load speaker metadata with graceful fallbacks.
+
+    Resolution order:
+    1. Explicit JSON (legacy): models/speaker_metadata.json containing full per-speaker stats.
+    2. New DL metadata JSON: models/speaker_dl_metadata.json (build a minimal 'speakers' map from label encoder mapping if detailed stats absent).
+    3. ML pickle metadata: models/speaker_models_metadata.pkl (extract label encoder classes only, create minimal structure).
+
     Returns:
-        Dictionary containing speaker metadata
+        Dict with at least a 'speakers' key mapping speaker_id -> stats dict (possibly minimal if only mapping available).
     """
-    if not os.path.exists(metadata_file):
-        return {}
-    
-    with open(metadata_file, 'r') as f:
-        return json.load(f)
+    # 1. Legacy JSON with full stats
+    if os.path.exists(metadata_file):
+        try:
+            with open(metadata_file, 'r') as f:
+                data = json.load(f)
+            # Ensure 'speakers' key
+            if 'speakers' not in data:
+                data['speakers'] = {}
+            return data
+        except Exception:
+            pass
+
+    # 2. New DL metadata JSON
+    if os.path.exists(dl_metadata_file):
+        try:
+            with open(dl_metadata_file, 'r') as f:
+                dl_meta = json.load(f)
+            speaker_mapping = dl_meta.get('speaker_mapping', {})
+            speakers_struct = {}
+            for idx_str, spk in speaker_mapping.items():
+                speakers_struct[spk] = {
+                    'id': spk,
+                    # Placeholders; detailed feature stats not present in DL metadata
+                    'feature_mean': [],
+                    'feature_std': [],
+                    'feature_min': [],
+                    'feature_max': [],
+                    'num_samples': None
+                }
+            return {
+                'source': 'dl_metadata',
+                'speakers': speakers_struct,
+                'raw': dl_meta
+            }
+        except Exception:
+            pass
+
+    # 3. ML pickle metadata (minimal)
+    if os.path.exists(ml_metadata_pkl):
+        try:
+            import joblib
+            meta = joblib.load(ml_metadata_pkl)
+            le = meta.get('label_encoder')
+            speakers_struct = {}
+            if le is not None and hasattr(le, 'classes_'):
+                for spk in le.classes_.tolist():
+                    speakers_struct[spk] = {
+                        'id': spk,
+                        'feature_mean': [],
+                        'feature_std': [],
+                        'feature_min': [],
+                        'feature_max': [],
+                        'num_samples': None
+                    }
+            return {
+                'source': 'ml_pickle',
+                'speakers': speakers_struct
+            }
+        except Exception:
+            pass
+
+    # Fallback empty structure
+    return {'speakers': {}}
 
 
 def get_speaker_feature_stats(speaker_id: str, 
@@ -291,4 +357,287 @@ def get_speaker_feature_stats(speaker_id: str,
         return {}
     
     return metadata['speakers'][speaker_id]
+
+
+def plot_model_comparison(metrics: Dict[str, Dict[str, float]],
+                          metrics_to_plot: List[str] = None,
+                          title: str = "Model Comparison") -> plt.Figure:
+    """
+    Plot bar charts comparing overall metrics for multiple models.
+
+    Args:
+        metrics: Dict mapping model_name -> dict of metric_name -> value (e.g. accuracy, f1_macro)
+        metrics_to_plot: list of metric keys to include (default: ['accuracy','f1_macro'])
+        title: Plot title
+
+    Returns:
+        Matplotlib Figure
+    """
+    if metrics_to_plot is None:
+        metrics_to_plot = ['accuracy', 'f1_macro']
+
+    model_names = list(metrics.keys())
+    n_models = len(model_names)
+
+    # Build matrix of values
+    values = np.zeros((len(metrics_to_plot), n_models))
+    for j, mname in enumerate(model_names):
+        for i, metric_key in enumerate(metrics_to_plot):
+            values[i, j] = metrics[mname].get(metric_key, np.nan)
+
+    x = np.arange(n_models)
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(max(8, n_models * 1.2), 5))
+    for i in range(len(metrics_to_plot)):
+        ax.bar(x + (i - len(metrics_to_plot)/2) * width/len(metrics_to_plot), values[i], width/len(metrics_to_plot), label=metrics_to_plot[i])
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(model_names, rotation=45, ha='right')
+    ax.set_ylabel('Score')
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(axis='y', alpha=0.3)
+    plt.tight_layout()
+    return fig
+
+
+def plot_confusion_matrix_grid(confusion_matrices: Dict[str, np.ndarray],
+                               labels: List[str],
+                               normalize: bool = False,
+                               cmap: str = 'Blues',
+                               title_prefix: str = '') -> plt.Figure:
+    """
+    Plot a grid of confusion matrices (one per model) for side-by-side comparison.
+
+    Args:
+        confusion_matrices: Dict mapping model_name -> confusion matrix (2D numpy array)
+        labels: list of class labels to show on axes
+        normalize: whether to normalize rows
+        cmap: colormap
+        title_prefix: optional prefix for each subplot title
+
+    Returns:
+        Matplotlib Figure
+    """
+    model_names = list(confusion_matrices.keys())
+    n = len(model_names)
+    cols = min(3, n)
+    rows = (n + cols - 1) // cols
+
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 5, rows * 4))
+    axes = np.array(axes).reshape(-1)
+
+    for ax_idx, model_name in enumerate(model_names):
+        ax = axes[ax_idx]
+        cm = np.array(confusion_matrices[model_name], dtype=float)
+        if normalize:
+            row_sums = cm.sum(axis=1, keepdims=True)
+            cm = np.divide(cm, row_sums, where=(row_sums != 0))
+
+        # Choose annotation format: use 2 decimals for normalized, integer-like for raw counts
+        fmt = '.2f' if normalize else '.0f'
+        sns.heatmap(cm, annot=True, fmt=fmt, cmap=cmap,
+                xticklabels=labels, yticklabels=labels, ax=ax)
+        ax.set_title(f"{title_prefix}{model_name}")
+        ax.set_ylabel('True')
+        ax.set_xlabel('Predicted')
+
+    # Hide unused axes
+    for i in range(len(model_names), len(axes)):
+        axes[i].axis('off')
+
+    plt.tight_layout()
+    return fig
+
+
+def plot_calibration_curves(y_true: np.ndarray,
+                            probas_dict: Dict[str, np.ndarray],
+                            n_bins: int = 10,
+                            title: str = 'Calibration Curves') -> plt.Figure:
+    """
+    Plot reliability diagrams (calibration curves) for multiple models.
+
+    Args:
+        y_true: true labels (binary or multi-class flattened for each class vs rest not supported here)
+        probas_dict: mapping model_name -> predicted probability for positive class (1D array)
+        n_bins: number of bins for calibration_curve
+
+    Returns:
+        Matplotlib Figure
+    """
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for model_name, probas in probas_dict.items():
+        probas = np.asarray(probas)
+        if probas.ndim != 1:
+            # If probabilities are (N, C), take max-prob as confidence
+            probas = probas.max(axis=1)
+        frac_pos, mean_pred = calibration_curve(y_true, probas, n_bins=n_bins, strategy='uniform')
+        ax.plot(mean_pred, frac_pos, marker='o', label=model_name)
+
+    ax.plot([0, 1], [0, 1], 'k:', label='Perfectly calibrated')
+    ax.set_xlabel('Mean predicted probability')
+    ax.set_ylabel('Fraction of positives')
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(True)
+    plt.tight_layout()
+    return fig
+
+
+def plot_per_class_heatmap(metrics_per_model: Dict[str, Dict[str, float]],
+                          title: str = 'Per-class metric heatmap',
+                          metric_name: Optional[str] = None) -> plt.Figure:
+    """
+    Create a heatmap of per-class metrics across multiple models.
+
+    Args:
+        metrics_per_model: dict mapping model_name -> dict[class_label -> metric_value]
+        metric_name: optional label for colorbar
+
+    Returns:
+        Matplotlib Figure
+    """
+    model_names = list(metrics_per_model.keys())
+    # collect all classes
+    classes = sorted({c for m in metrics_per_model.values() for c in m.keys()})
+    data = np.zeros((len(model_names), len(classes)))
+    data[:] = np.nan
+    for i, m in enumerate(model_names):
+        for j, c in enumerate(classes):
+            data[i, j] = metrics_per_model[m].get(c, np.nan)
+
+    fig, ax = plt.subplots(figsize=(max(8, len(classes) * 0.6), max(4, len(model_names) * 0.6)))
+    sns.heatmap(data, xticklabels=classes, yticklabels=model_names, annot=True, fmt='.2f', cmap='viridis', ax=ax)
+    ax.set_title(title)
+    ax.set_xlabel('Class')
+    ax.set_ylabel('Model')
+    plt.tight_layout()
+    return fig
+
+
+def plot_embeddings_tsne(embeddings: np.ndarray,
+                         labels: List[str],
+                         pred_labels: Optional[List[str]] = None,
+                         title: str = 't-SNE embedding') -> plt.Figure:
+    """
+    Reduce embeddings to 2D via t-SNE and plot colored by true labels (and optionally predicted labels).
+
+    Args:
+        embeddings: (N, D) array of embeddings
+        labels: list of true labels
+        pred_labels: optional predicted labels to plot with different marker
+
+    Returns:
+        Matplotlib Figure
+    """
+    tsne = TSNE(n_components=2, random_state=42)
+    X2 = tsne.fit_transform(embeddings)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    unique_labels = sorted(list(set(labels)))
+    palette = sns.color_palette('tab10', n_colors=max(2, len(unique_labels)))
+    color_map = {lab: palette[i % len(palette)] for i, lab in enumerate(unique_labels)}
+
+    for lab in unique_labels:
+        mask = [l == lab for l in labels]
+        pts = X2[np.array(mask)]
+        ax.scatter(pts[:, 0], pts[:, 1], label=lab, color=color_map[lab], alpha=0.7, s=30)
+
+    if pred_labels is not None:
+        # overlay predicted label mismatches
+        mismatches = [t != p for t, p in zip(labels, pred_labels)]
+        if any(mismatches):
+            pts = X2[np.array(mismatches)]
+            ax.scatter(pts[:, 0], pts[:, 1], facecolors='none', edgecolors='k', s=80, linewidths=0.8, label='mismatch')
+
+    ax.set_title(title)
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    return fig
+
+
+def plot_overfitting_detection(metrics: Dict[str, Dict] = None,
+                                histories: Dict[str, Dict] = None,
+                                results_dir: str = 'results') -> None:
+    """
+    Generate overfitting-detection visualizations.
+
+    - For ML models: provide `metrics` mapping model_name -> {'cv_mean'|'train': float, 'test': float}
+      This will produce `overfitting_train_test.png` comparing train (CV) vs test accuracy.
+    - For DL models: provide `histories` mapping model_name -> history dict containing
+      keys like 'loss','val_loss','accuracy','val_accuracy'. This will produce two files:
+      `overfitting_loss_curves.png` and `overfitting_accuracy_curves.png`.
+
+    Files are written into `results_dir`.
+    """
+    os.makedirs(results_dir, exist_ok=True)
+
+    # 1) ML-style train vs test bar chart
+    if metrics:
+        model_names = list(metrics.keys())
+        train_vals = [metrics[m].get('train', metrics[m].get('cv_mean', np.nan)) for m in model_names]
+        test_vals = [metrics[m].get('test', np.nan) for m in model_names]
+
+        x = np.arange(len(model_names))
+        width = 0.35
+        fig, ax = plt.subplots(figsize=(max(8, len(model_names) * 1.2), 5))
+        ax.bar(x - width/2, train_vals, width, label='Train (CV)', color='skyblue')
+        ax.bar(x + width/2, test_vals, width, label='Test', color='orange')
+        ax.set_xticks(x)
+        ax.set_xticklabels(model_names, rotation=45, ha='right')
+        ax.set_ylabel('Accuracy')
+        ax.set_title('Train vs Test Accuracy (Overfitting check)')
+        ax.legend()
+        ax.grid(axis='y', alpha=0.3)
+        plt.tight_layout()
+        out_path = os.path.join(results_dir, 'overfitting_train_test.png')
+        fig.savefig(out_path)
+        print(f"Saved overfitting train/test plot to {out_path}")
+
+    # 2) DL-style learning curves (loss and accuracy)
+    if histories:
+        # Loss curves
+        fig1, ax1 = plt.subplots(figsize=(8, 6))
+        any_loss = False
+        for model_name, hist in histories.items():
+            if hist is None:
+                continue
+            if 'loss' in hist and 'val_loss' in hist:
+                ax1.plot(hist['loss'], label=f'{model_name} train loss')
+                ax1.plot(hist['val_loss'], label=f'{model_name} val loss', linestyle='--')
+                any_loss = True
+        if any_loss:
+            ax1.set_xlabel('Epoch')
+            ax1.set_ylabel('Loss')
+            ax1.set_title('Training vs Validation Loss')
+            ax1.legend()
+            ax1.grid(True)
+            plt.tight_layout()
+            out_loss = os.path.join(results_dir, 'overfitting_loss_curves.png')
+            fig1.savefig(out_loss)
+            print(f"Saved loss curves to {out_loss}")
+
+        # Accuracy curves
+        fig2, ax2 = plt.subplots(figsize=(8, 6))
+        any_acc = False
+        for model_name, hist in histories.items():
+            if hist is None:
+                continue
+            if 'accuracy' in hist and 'val_accuracy' in hist:
+                ax2.plot(hist['accuracy'], label=f'{model_name} train acc')
+                ax2.plot(hist['val_accuracy'], label=f'{model_name} val acc', linestyle='--')
+                any_acc = True
+        if any_acc:
+            ax2.set_xlabel('Epoch')
+            ax2.set_ylabel('Accuracy')
+            ax2.set_title('Training vs Validation Accuracy')
+            ax2.legend()
+            ax2.grid(True)
+            plt.tight_layout()
+            out_acc = os.path.join(results_dir, 'overfitting_accuracy_curves.png')
+            fig2.savefig(out_acc)
+            print(f"Saved accuracy curves to {out_acc}")
+
+    return
 
