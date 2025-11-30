@@ -8,6 +8,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.impute import SimpleImputer
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.metrics import top_k_accuracy_score, accuracy_score
 import xgboost as xgb
@@ -20,7 +21,7 @@ from typing import Tuple, Dict, List, Any
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
 from src.data_loader import EmotionDatasetLoader
-from src.feature_extraction import FeatureExtractor
+from src.speaker_feature_extraction import SpeakerFeatureExtractor  # Speaker-optimized features
 from src.evaluation import ModelEvaluator
 from src.utils import save_features, load_features, save_preprocessed_audio, load_preprocessed_audio
 
@@ -45,6 +46,7 @@ class SpeakerMLTrainer:
         }
         
         self.scaler = StandardScaler()
+        self.imputer = SimpleImputer(strategy='mean')  # Handle NaN values
         self.label_encoder = LabelEncoder()
         self.model = None  # For backward compatibility (best model)
         self.trained_models = {}  # Store all trained models
@@ -55,6 +57,11 @@ class SpeakerMLTrainer:
         """
         Prepare data for training.
         """
+        # Check for NaN values
+        nan_count = np.isnan(X).sum()
+        if nan_count > 0:
+            print(f"  Warning: Found {nan_count} NaN values in features. Replacing with mean values.")
+        
         # Encode labels first
         y_encoded = self.label_encoder.fit_transform(y)
 
@@ -63,9 +70,13 @@ class SpeakerMLTrainer:
             X, y_encoded, test_size=test_size, random_state=random_state, stratify=y_encoded
         )
         
+        # Handle NaN values (impute with mean)
+        X_train_imputed = self.imputer.fit_transform(X_train)
+        X_test_imputed = self.imputer.transform(X_test)
+        
         # Scale features
-        X_train_scaled = self.scaler.fit_transform(X_train)
-        X_test_scaled = self.scaler.transform(X_test)
+        X_train_scaled = self.scaler.fit_transform(X_train_imputed)
+        X_test_scaled = self.scaler.transform(X_test_imputed)
         
         return X_train_scaled, X_test_scaled, y_train, y_test
     
@@ -158,8 +169,6 @@ class SpeakerMLTrainer:
                     self.model = self.trained_models[model_name]
             except Exception as e:
                 print(f"Error training {model_name}: {e}")
-                import traceback
-                traceback.print_exc()
         
         # Print summary
         if results['best_model']:
@@ -184,7 +193,9 @@ class SpeakerMLTrainer:
                 raise ValueError(f"Model {model_name} not trained yet")
             model = self.trained_models[model_name]
         
-        X_scaled = self.scaler.transform(X)
+        # Handle NaN values and scale features
+        X_imputed = self.imputer.transform(X)
+        X_scaled = self.scaler.transform(X_imputed)
         predictions = model.predict(X_scaled)
         probabilities = model.predict_proba(X_scaled)
         
@@ -200,6 +211,7 @@ class SpeakerMLTrainer:
             metadata = {
                 'models': {},
                 'scaler': self.scaler,
+                'imputer': self.imputer,
                 'label_encoder': self.label_encoder,
                 'best_model_name': self.best_model_name
             }
@@ -224,6 +236,7 @@ class SpeakerMLTrainer:
             model_data = {
                 'model': self.trained_models[model_name],
                 'scaler': self.scaler,
+                'imputer': self.imputer,
                 'label_encoder': self.label_encoder,
                 'model_name': model_name
             }
@@ -248,6 +261,7 @@ class SpeakerMLTrainer:
         if 'models' in model_data:
             self.trained_models = model_data['models']
             self.scaler = model_data['scaler']
+            self.imputer = model_data.get('imputer', SimpleImputer(strategy='mean'))
             self.label_encoder = model_data['label_encoder']
             self.best_model_name = model_data.get('best_model_name')
             if self.best_model_name:
@@ -256,6 +270,7 @@ class SpeakerMLTrainer:
             # Single model file
             self.model = model_data['model']
             self.scaler = model_data['scaler']
+            self.imputer = model_data.get('imputer', SimpleImputer(strategy='mean'))
             self.label_encoder = model_data['label_encoder']
             self.best_model_name = model_data.get('model_name')
             
@@ -352,23 +367,22 @@ def train(models_dir='models', test_size=0.2):
     
     if len(all_audio) == 0:
         print(f"  Loading and preprocessing audio files (this may take a while)...")
-        all_audio = []
-        all_speakers = []
         
         # Load all datasets
         audio_files, emotion_labels = loader.load_all_datasets()
         
         # Extract speaker IDs
         for i, audio_file in enumerate(audio_files):
-            # Determine dataset from path
+            # Determine dataset from path (case-insensitive)
+            audio_file_lower = audio_file.lower()
             dataset = None
-            if 'TESS' in audio_file or 'tess' in audio_file:
+            if 'tess' in audio_file_lower:
                 dataset = 'TESS'
-            elif 'SAVEE' in audio_file or 'savee' in audio_file:
+            elif 'savee' in audio_file_lower:
                 dataset = 'SAVEE'
-            elif 'RAVDESS' in audio_file or 'ravdess' in audio_file:
+            elif 'ravdess' in audio_file_lower:
                 dataset = 'RAVDESS'
-            elif 'CREMA' in audio_file or 'crema' in audio_file:
+            elif 'crema' in audio_file_lower:
                 dataset = 'CREMA-D'
             
             if dataset:
@@ -393,9 +407,22 @@ def train(models_dir='models', test_size=0.2):
     
     if os.path.exists(feature_file):
         print(f"  Loading pre-extracted features...")
-        features, speakers = load_features(feature_file)
+        try:
+            features, speakers = load_features(feature_file)
+            print(f"  Loaded features with shape: {features.shape}")
+            print(f"  Loaded {len(speakers)} speaker labels")
+        except Exception as e:
+            print(f"  [WARNING] Failed to load feature cache: {e}")
+            print(f"  Regenerating features...")
+            os.remove(feature_file)
+            print("  Using speaker-optimized feature extractor (72 features)...")
+            extractor = SpeakerFeatureExtractor()  # 72 features vs 65 for emotion
+            features = extractor.extract_features_batch(all_audio)
+            speakers = np.array(all_speakers)
+            save_features(features, speakers, feature_file)
     else:
-        extractor = FeatureExtractor()
+        print("  Using speaker-optimized feature extractor (72 features)...")
+        extractor = SpeakerFeatureExtractor()  # 72 features vs 65 for emotion
         features = extractor.extract_features_batch(all_audio)
         speakers = np.array(all_speakers)
         save_features(features, speakers, feature_file)
@@ -426,17 +453,34 @@ def train(models_dir='models', test_size=0.2):
             y_test_decoded, y_pred_decoded, labels=present_speakers
         )
         evaluator.print_evaluation_results(eval_results, model_name, labels=present_speakers)
+        # Save confusion matrix with unique name for speaker ML
         evaluator.plot_confusion_matrix(
-            eval_results['confusion_matrix'], present_speakers, model_name
+            eval_results['confusion_matrix'], present_speakers, 
+            model_name, save_name=f'confusion_matrix_speaker_ml_{model_name}'
         )
         
         # Save with distinctive name and header
+        # Save evaluation results with unique speaker ML naming
         evaluator.save_results(
             eval_results, 
-            f"{model_name} (Speaker ID)", 
-            filepath=os.path.join(evaluator.results_dir, f'evaluation_{model_name}_speaker.txt'),
+            f"{model_name} (Speaker ID - ML)", 
+            filepath=os.path.join(evaluator.results_dir, f'evaluation_speaker_ml_{model_name}.txt'),
             labels=present_speakers
         )
+        
+        # Save JSON for potential visualization (unique name)
+        try:
+            import json
+            eval_json = {
+                "meta": {"model_name": f"speaker_ml_{model_name}", "labels": present_speakers},
+                "results": {k: (v.tolist() if isinstance(v, np.ndarray) else v) 
+                           for k, v in eval_results.items()}
+            }
+            json_path = os.path.join(evaluator.results_dir, f'evaluation_speaker_ml_{model_name}.json')
+            with open(json_path, 'w') as f:
+                json.dump(eval_json, f, indent=2)
+        except Exception as e:
+            print(f"  Warning: Could not save JSON: {e}")
         
         speaker_identifier.save_model(model_name)
         

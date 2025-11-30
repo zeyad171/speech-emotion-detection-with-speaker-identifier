@@ -10,6 +10,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
+from typing import Optional
 import os
 import time
 from typing import Tuple, Dict, Any
@@ -22,6 +23,8 @@ from src.data_loader import EmotionDatasetLoader
 from src.feature_extraction import FeatureExtractor
 from src.evaluation import ModelEvaluator
 from src.utils import save_preprocessed_audio, load_preprocessed_audio, save_dl_data, load_dl_data
+from src.models.dl_param_config import DLParamConfig
+from src.models.dl_param_config import DLParamConfig
 
 # Global flag to prevent repeated GPU configuration prints
 _gpu_config_printed = False
@@ -200,16 +203,34 @@ class RNNModel(nn.Module):
 
 class EmotionDLTrainer:
     """Train and evaluate deep learning models for emotion detection using PyTorch."""
-    
-    def __init__(self, models_dir: str = 'models'):
+
+    def __init__(self, models_dir: str = 'models', cfg: Optional[DLParamConfig] = None):
         self.models_dir = models_dir
         os.makedirs(models_dir, exist_ok=True)
-        
+
         self.label_encoder = LabelEncoder()
         self.trained_models = {}
-        self.model_configs = {} 
+        self.model_configs = {}
         self.device = _device
         self.gpu_available = _GPU_AVAILABLE
+        # Configuration object for training hyperparameters and finetune settings
+        self.cfg = cfg or DLParamConfig()
+
+    def _freeze_backbone_head_only(self, model: nn.Module) -> None:
+        """
+        Freeze all parameters except those that look like head/classifier params.
+        Heuristic: parameter names containing 'fc' or 'classifier' are treated as head.
+        """
+        for name, param in model.named_parameters():
+            if 'fc' in name or 'classifier' in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+
+    def _unfreeze_all(self, model: nn.Module) -> None:
+        """Unfreeze all model parameters."""
+        for param in model.parameters():
+            param.requires_grad = True
     
     def prepare_spectrograms(self, audio_list, extractor, target_shape=(128, 128)):
         """Prepare mel spectrograms for CNN models (Padding/Cropping instead of Resizing)."""
@@ -317,8 +338,33 @@ class EmotionDLTrainer:
                               pin_memory=self.gpu_available, num_workers=0)
         
         criterion = nn.CrossEntropyLoss()
-        optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+
+        # Unified finetune handling (head-phase then full-phase) with per-model overrides
+        cfg = self.cfg
+        wd = getattr(cfg, 'weight_decay', 0.01)
+
+        # model_name corresponds to 'cnn'|'lstm'|'rnn'
+        model_key = model_name.lower()
+        model_finetune = {}
+        if hasattr(cfg, f"{model_key}_finetune"):
+            model_finetune = getattr(cfg, f"{model_key}_finetune") or {}
+
+        freeze_flag = model_finetune.get('freeze_backbone', getattr(cfg, 'freeze_backbone', False))
+        head_epochs = int(model_finetune.get('finetune_head_epochs', getattr(cfg, 'finetune_head_epochs', 0))) if freeze_flag else 0
+        head_lr = model_finetune.get('head_lr', getattr(cfg, 'head_lr', getattr(cfg, 'learning_rate', 0.001)))
+        full_phase_lr = model_finetune.get('full_finetune_lr', getattr(cfg, 'full_finetune_lr', getattr(cfg, 'learning_rate', 0.001)))
+
+        # If configured to run a head-only phase, freeze backbone before creating optimizer
+        if head_epochs > 0:
+            self._freeze_backbone_head_only(model)
+            initial_lr = head_lr
+        else:
+            # no head-only phase, train all params from start
+            self._unfreeze_all(model)
+            initial_lr = getattr(cfg, 'learning_rate', 0.001)
+
+        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=initial_lr, weight_decay=wd)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=getattr(cfg, 'scheduler_patience', 5))
         
         scaler = torch.amp.GradScaler('cuda') if self.gpu_available else None
         
@@ -347,6 +393,12 @@ class EmotionDLTrainer:
         epoch_start_time = None
         
         for epoch in range(epochs):
+            # Switch from head-phase to full-phase if configured
+            if head_epochs > 0 and epoch == head_epochs:
+                # Unfreeze whole model and recreate optimizer with full-phase LR
+                self._unfreeze_all(model)
+                optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=full_phase_lr, weight_decay=wd)
+                scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=getattr(cfg, 'scheduler_patience', 5))
             if epoch == 0:
                 epoch_start_time = time.time()
             
@@ -506,8 +558,6 @@ class EmotionDLTrainer:
             results['cnn'] = {'model': cnn, 'history': hist, 'test_acc': 0}
         except Exception as e:
             print(f"CNN Failed: {e}")
-            import traceback
-            traceback.print_exc()
 
         try:
             print("\nStarting LSTM Training...")
@@ -519,8 +569,6 @@ class EmotionDLTrainer:
             results['lstm'] = {'model': lstm, 'history': hist}
         except Exception as e:
             print(f"LSTM Failed: {e}")
-            import traceback
-            traceback.print_exc()
         
         try:
             print("\nStarting RNN Training...")
@@ -532,8 +580,6 @@ class EmotionDLTrainer:
             results['rnn'] = {'model': rnn, 'history': hist}
         except Exception as e:
             print(f"RNN Failed: {e}")
-            import traceback
-            traceback.print_exc()
         
         return results
 
@@ -542,7 +588,7 @@ class EmotionDLTrainer:
             raise ValueError(f"Model {model_name} not found")
         
         if filepath is None:
-            filepath = os.path.join(self.models_dir, f'{model_name}.pth')
+            filepath = os.path.join(self.models_dir, f'emotion_dl_{model_name}.pth')
             
         # Determine model type
         if 'cnn' in model_name:
@@ -597,7 +643,7 @@ class EmotionDLTrainer:
         self.label_encoder = checkpoint['label_encoder']
         return model
 
-def train(models_dir='models', test_size=0.2, validation_size=0.1, random_state=42, epochs=100, batch_size=256):
+def train(models_dir='models', test_size=0.2, validation_size=0.1, random_state=42, epochs: int = None, batch_size: int = None, cfg: DLParamConfig = None):
     """
     Complete training pipeline for emotion detection DL models.
     
@@ -614,6 +660,14 @@ def train(models_dir='models', test_size=0.2, validation_size=0.1, random_state=
     print("="*60)
     
     os.makedirs(models_dir, exist_ok=True)
+
+    # Configuration: prefer explicit args, otherwise use cfg defaults
+    if cfg is None:
+        cfg = DLParamConfig()
+    if epochs is None:
+        epochs = cfg.epochs
+    if batch_size is None:
+        batch_size = cfg.batch_size
     
     # Load datasets
     print("\n[1/6] Loading datasets...")
@@ -777,11 +831,14 @@ def train(models_dir='models', test_size=0.2, validation_size=0.1, random_state=
         
         print(f"    Saving confusion matrix...")
         evaluator.plot_confusion_matrix(
-            eval_results['confusion_matrix'], unique_labels, f"{model_name.upper()}_emotion"
+            eval_results['confusion_matrix'], unique_labels, f"{model_name.upper()}_emotion",
+            save_name=f'confusion_matrix_emotion_dl_{model_name}'
         )
         
         print(f"    Saving results...")
-        evaluator.save_results(eval_results, model_name.upper(), labels=unique_labels)
+        evaluator.save_results(eval_results, f"{model_name.upper()} (Emotion - DL)", 
+                             labels=unique_labels,
+                             filepath=os.path.join(evaluator.results_dir, f'evaluation_emotion_dl_{model_name}.txt'))
         
         print(f"    Saving model...")
         dl_trainer.save_model(model_name)
@@ -796,6 +853,12 @@ def train(models_dir='models', test_size=0.2, validation_size=0.1, random_state=
     print(f"\n{'='*60}")
     print(f"Best model: {best_model} (Accuracy: {best_score:.4f})")
     print(f"{'='*60}")
+    # Save used config for reproducibility
+    try:
+        cfg.save(os.path.join(models_dir, 'dl_config_emotion.json'))
+        print(f"Saved DL config to {os.path.join(models_dir, 'dl_config_emotion.json')}")
+    except Exception:
+        pass
 
 
 if __name__ == '__main__':
