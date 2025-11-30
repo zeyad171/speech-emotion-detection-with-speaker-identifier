@@ -1,0 +1,4 @@
+"""
+Speech Emotion Detection package.
+"""
+
