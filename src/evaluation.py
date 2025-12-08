@@ -72,15 +72,16 @@ class ModelEvaluator:
         return results
     
     def plot_confusion_matrix(self, cm: np.ndarray, labels: List[str], 
-                             model_name: str, save_path: str = None):
+                             model_name: str, save_path: str = None, save_name: str = None):
         """
         Plot confusion matrix.
         
         Args:
             cm: Confusion matrix
             labels: Label names
-            model_name: Name of the model
-            save_path: Path to save the plot
+            model_name: Name of the model (for title)
+            save_path: Path to save the plot (overrides save_name)
+            save_name: Custom filename without extension (e.g., 'confusion_matrix_emotion_ml_svm')
         """
         plt.figure(figsize=(10, 8))
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
@@ -91,7 +92,9 @@ class ModelEvaluator:
         plt.tight_layout()
         
         if save_path is None:
-            save_path = os.path.join(self.results_dir, f'confusion_matrix_{model_name}.png')
+            if save_name is None:
+                save_name = f'confusion_matrix_{model_name}'
+            save_path = os.path.join(self.results_dir, f'{save_name}.png')
         
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()

@@ -558,8 +558,6 @@ class EmotionDLTrainer:
             results['cnn'] = {'model': cnn, 'history': hist, 'test_acc': 0}
         except Exception as e:
             print(f"CNN Failed: {e}")
-            import traceback
-            traceback.print_exc()
 
         try:
             print("\nStarting LSTM Training...")
@@ -571,8 +569,6 @@ class EmotionDLTrainer:
             results['lstm'] = {'model': lstm, 'history': hist}
         except Exception as e:
             print(f"LSTM Failed: {e}")
-            import traceback
-            traceback.print_exc()
         
         try:
             print("\nStarting RNN Training...")
@@ -584,8 +580,6 @@ class EmotionDLTrainer:
             results['rnn'] = {'model': rnn, 'history': hist}
         except Exception as e:
             print(f"RNN Failed: {e}")
-            import traceback
-            traceback.print_exc()
         
         return results
 
@@ -594,7 +588,7 @@ class EmotionDLTrainer:
             raise ValueError(f"Model {model_name} not found")
         
         if filepath is None:
-            filepath = os.path.join(self.models_dir, f'{model_name}.pth')
+            filepath = os.path.join(self.models_dir, f'emotion_dl_{model_name}.pth')
             
         # Determine model type
         if 'cnn' in model_name:
@@ -837,11 +831,14 @@ def train(models_dir='models', test_size=0.2, validation_size=0.1, random_state=
         
         print(f"    Saving confusion matrix...")
         evaluator.plot_confusion_matrix(
-            eval_results['confusion_matrix'], unique_labels, f"{model_name.upper()}_emotion"
+            eval_results['confusion_matrix'], unique_labels, f"{model_name.upper()}_emotion",
+            save_name=f'confusion_matrix_emotion_dl_{model_name}'
         )
         
         print(f"    Saving results...")
-        evaluator.save_results(eval_results, model_name.upper(), labels=unique_labels)
+        evaluator.save_results(eval_results, f"{model_name.upper()} (Emotion - DL)", 
+                             labels=unique_labels,
+                             filepath=os.path.join(evaluator.results_dir, f'evaluation_emotion_dl_{model_name}.txt'))
         
         print(f"    Saving model...")
         dl_trainer.save_model(model_name)
