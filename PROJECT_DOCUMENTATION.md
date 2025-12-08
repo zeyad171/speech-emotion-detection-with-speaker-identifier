@@ -26,18 +26,22 @@ project/
 │
 ├── src/                       # Core source code
 │   ├── data_loader.py         # Dataset loading and preprocessing
-│   ├── feature_extraction.py  # Feature extraction (65 features)
+│   ├── feature_extraction.py  # Feature extraction (65 features) + LLVM fix
 │   ├── evaluation.py          # Model evaluation metrics
-│   ├── utils.py               # Utility functions
-│   ├── visualization.py        # Visualization helpers for speaker comparison
+│   ├── utils.py               # Utility functions (caching, file I/O)
+│   ├── visualization.py        # Visualization helpers for comparisons and analysis
 │   └── models/
 │       ├── emotion_ml.py      # Emotion detection ML models and training (LR, RF, SVM, XGBoost)
 │       ├── emotion_dl.py      # Emotion detection DL models and training (CNN, LSTM, RNN)
 │       ├── speaker_ml.py      # Speaker identification ML models and training (LR, RF, SVM, XGBoost)
-│       └── speaker_dl.py      # Speaker identification DL models and training (CNN, LSTM, RNN)
+│       ├── speaker_dl.py      # Speaker identification DL models and training (CNN, LSTM, RNN)
+│       └── dl_param_config.py # DL parameter configuration helper class
+│
+├── scripts/                   # Helper scripts
+│   └── generate_dl_config.py  # DL config JSON generator (CLI tool)
 │
 ├── app/
-│   └── app.py                # Streamlit web interface
+│   └── app.py                # Streamlit web interface (multi-tab)
 │
 ├── models/                    # Saved models and features (generated)
 ├── results/                   # Evaluation results (generated)
@@ -45,7 +49,69 @@ project/
 │
 ├── main.py                    # Main entry point with CLI
 ├── requirements.txt          # Python dependencies
-└── README.md                 # User documentation
+├── README.md                 # User documentation
+└── PROJECT_DOCUMENTATION.md  # This file - Technical documentation
+```
+
+## Environment Configuration
+
+### LLVM Symbol Error Fix
+
+**Issue:** When using NumPy with Intel MKL on certain CPUs (especially with AVX-512 support), you may encounter:
+```
+LLVM ERROR: Symbol not found: __svml_cosf8_ha
+```
+
+**Root Cause:** This is a known incompatibility between NumPy's Intel MKL library and certain CPU instruction sets (AVX-512).
+
+**Automatic Fix:** The project automatically handles this in `src/feature_extraction.py` by setting environment variables **before** importing NumPy:
+
+```python
+# Set environment variables BEFORE importing NumPy to prevent LLVM errors
+import os
+os.environ['NPY_DISABLE_CPU_FEATURES'] = 'AVX512F,AVX512CD,AVX512_SKX'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+
+import numpy as np
+# ... rest of imports
+```
+
+**What it does:**
+- `NPY_DISABLE_CPU_FEATURES`: Disables specific AVX-512 instruction sets that cause LLVM errors
+- `OPENBLAS_NUM_THREADS`: Limits OpenBLAS to single-threaded mode for stability
+
+**Impact:**
+- **Stability**: Prevents LLVM crashes during feature extraction
+- **Performance**: Minor reduction in numerical computation speed (~5-10%)
+- **Compatibility**: Works across different CPU architectures
+
+**Manual Override:** If needed, you can set these environment variables manually before running the code:
+
+```bash
+# Windows PowerShell
+$env:NPY_DISABLE_CPU_FEATURES="AVX512F,AVX512CD,AVX512_SKX"
+$env:OPENBLAS_NUM_THREADS="1"
+
+# Linux/Mac Bash
+export NPY_DISABLE_CPU_FEATURES="AVX512F,AVX512CD,AVX512_SKX"
+export OPENBLAS_NUM_THREADS="1"
+```
+
+### Other Environment Variables
+
+**CUDA/PyTorch (for GPU training):**
+```bash
+# Disable cuDNN benchmarking (for reproducibility)
+export CUDNN_BENCHMARK=0
+
+# Set specific GPU device
+export CUDA_VISIBLE_DEVICES=0
+```
+
+**Python Path:**
+The project automatically adds `src/` to the Python path in `main.py`:
+```python
+sys.path.append(str(Path(__file__).parent))
 ```
 
 ## Core Components
@@ -108,7 +174,14 @@ project/
 - `extract_mel_spectrogram()` - For deep learning models (optional)
 
 **Feature Caching:**
-- Features saved to `models/extracted_features.npz` to avoid recomputation
+- Features saved to `models/extracted_features.npz` (emotion) or `models/extracted_features_speakers.npz` (speaker) to avoid recomputation
+- Cache key: Feature extraction parameters (n_mfcc, n_mels, hop_length)
+- Delete cache file to force re-extraction with new parameters
+
+**LLVM Error Prevention:**
+- Environment variables set at module import (before NumPy)
+- Ensures stability across different CPU architectures
+- See [Environment Configuration](#environment-configuration) for details
 
 ### 3. Emotion Detection - ML Models (`src/models/emotion_ml.py`)
 
@@ -612,18 +685,199 @@ python app/app.py
 ## Dependencies
 
 **Core Libraries:**
-- numpy - Numerical operations
-- pandas - Data manipulation
-- librosa - Audio processing and feature extraction
-- soundfile - Audio file I/O
-- scikit-learn - Machine learning models and utilities
-- torch (PyTorch) - Deep learning models with GPU support
-- xgboost - Gradient boosting
-- streamlit - Web interface
-- matplotlib/seaborn - Visualization
-- scipy - Scientific computing
+- **numpy** - Numerical operations (with LLVM error mitigation)
+- **pandas** (>=1.3.0) - Data manipulation
+- **librosa** (>=0.9.0) - Audio processing and feature extraction
+- **soundfile** (>=0.10.0) - Audio file I/O
+- **scikit-learn** (>=1.0.0) - Machine learning models and utilities
+- **torch** (>=2.0.0) - Deep learning models with GPU support (PyTorch)
+- **xgboost** (>=1.5.0) - Gradient boosting
+- **streamlit** (>=1.10.0) - Web interface
+- **matplotlib** (>=3.5.0) / **seaborn** (>=0.11.0) - Visualization
+- **scipy** (>=1.10.0) - Scientific computing
 
 **See `requirements.txt` for version constraints.**
+
+**GPU Support (Optional):**
+```bash
+# CUDA 12.4 (Windows/Linux)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+
+# CPU-only  
+pip install torch torchvision torchaudio
+```
+
+## Helper Scripts and Tools
+
+### DL Configuration Generator (`scripts/generate_dl_config.py`)
+
+**Purpose:** Command-line tool to generate JSON configuration files for deep learning models, supporting both emotion and speaker identification tasks.
+
+**Key Features:**
+- Generates config files compatible with `DLParamConfig` class
+- Supports per-model fine-tuning blocks (`cnn_finetune`, `lstm_finetune`, `rnn_finetune`)
+- Allows CLI overrides using dot notation for nested keys
+- Optional HPO (Hyperparameter Optimization) space inclusion
+- Creates combined configs for all models or individual model configs
+
+**Usage Examples:**
+
+```bash
+# Generate combined config for all models (recommended)
+python scripts/generate_dl_config.py --target both --output models/my_dl_config.json
+
+# Generate emotion-specific config with CNN fine-tuning
+python scripts/generate_dl_config.py --target emotion --model-type cnn --output models/emotion_cnn.json
+
+# Generate speaker config with LSTM, include HPO space
+python scripts/generate_dl_config.py --target speaker --model-type lstm --include-hpo --output models/speaker_lstm.json
+
+# Override specific parameters using dot notation
+python scripts/generate_dl_config.py --target emotion \
+  --set cnn_finetune.head_lr=0.0005 \
+  --set lstm_finetune.finetune_head_epochs=0 \
+  --output models/custom_config.json
+```
+
+**Command-Line Arguments:**
+- `--target` : Target task type (`emotion`, `speaker`, or `both`)
+- `--model-type` : Specific model architecture (`cnn`, `lstm`, `rnn`)
+- `--output` : Output JSON file path (default: `models/dl_config_{target}.json`)
+- `--set key=value` : Override nested config values (e.g., `cnn_finetune.head_lr=0.001`)
+- `--include-hpo` : Include HPO search space in the config
+
+**Integration with Training:**
+```bash
+# Train using generated config
+python main.py --mode train_emotion_dl --cfg models/my_dl_config.json --test_size 0.2
+```
+
+### DL Parameter Configuration Class (`src/models/dl_param_config.py`)
+
+**Class:** `DLParamConfig`
+
+**Purpose:** Python class for creating, loading, and managing deep learning hyperparameter configurations.
+
+**Key Methods:**
+- `__init__()` - Initializes with default values
+- `update_from_dict(params)` - Updates config from dictionary
+- `save(filepath)` - Saves config to JSON file
+- `load(filepath)` - Loads config from JSON file (class method)
+- `to_dict()` - Exports config as dictionary
+
+**Configuration Structure:**
+```json
+{
+  "epochs": 50,
+  "batch_size": 32,
+  "learning_rate": 0.001,
+  "dropout": 0.3,
+  "weight_decay": 0.01,
+  "cnn_finetune": {
+    "head_lr": 0.001,
+    "finetune_head_epochs": 10,
+    "full_lr": 0.0001
+  },
+  "lstm_finetune": {
+    "head_lr": 0.001,
+    "finetune_head_epochs": 10,
+    "full_lr": 0.0001
+  },
+  "rnn_finetune": {
+    "head_lr": 0.001,
+    "finetune_head_epochs": 10,
+    "full_lr": 0.0001
+  }
+}
+```
+
+**Programmatic Usage:**
+```python
+from src.models.dl_param_config import DLParamConfig
+
+# Create and customize config
+cfg = DLParamConfig()
+cfg.update_from_dict({
+    'epochs': 60,
+    'batch_size': 64,
+    'learning_rate': 5e-4,
+    'dropout': 0.35,
+})
+cfg.save('models/my_config.json')
+
+# Load existing config
+cfg = DLParamConfig.load('models/my_config.json')
+```
+
+**How Trainers Use Configs:**
+- `emotion_dl.py` and `speaker_dl.py` accept optional `cfg` parameter
+- Config loaded via `main.py --cfg` flag
+- Per-model fine-tuning blocks (`cnn_finetune`, etc.) override general parameters
+- Saved copy: `models/dl_config_emotion.json` or `models/dl_config_speaker.json`
+
+## Cache Files and Data Persistence
+
+### Cache File Structure
+
+The project uses aggressive caching to avoid reprocessing audio files. All cache files are stored in the `models/` directory:
+
+**Emotion Detection Cache:**
+- `models/preprocessed_audio.npz` - Preprocessed audio signals (normalized, trimmed, resampled)
+- `models/extracted_features.npz` - ML features (65-dimensional vectors)
+- `models/dl_data.npz` - DL data (spectrograms for CNN, sequences for LSTM/RNN)
+
+**Speaker Identification Cache:**
+- `models/preprocessed_audio_speakers.npz` - Preprocessed audio for speaker models
+- `models/extracted_features_speakers.npz` - ML features for speaker models
+- `models/dl_data_speakers.npz` - DL data for speaker models
+
+**Cache Contents (NPZ format):**
+```python
+# Example: extracted_features.npz
+np.load('models/extracted_features.npz', allow_pickle=True)
+# Returns: {'features': ndarray, 'labels': ndarray, 'files': ndarray}
+```
+
+### When to Clear Cache
+
+**Clear cache when:**
+1. **Modifying feature extraction parameters** (n_mfcc, n_mels, hop_length)
+2. **Adding/removing dataset files** (ensures new files are processed)
+3. **Changing preprocessing logic** (trim_silence, target_sr)
+4. **Encountering data inconsistency errors**
+
+**How to clear cache:**
+```bash
+# Windows PowerShell
+Remove-Item models\*.npz
+
+# Linux/Mac
+rm models/*.npz
+```
+
+**Note:** Clearing cache will require full reprocessing (1-2 hours for all datasets), but ensures data consistency.
+
+### Model Files
+
+**ML Models (.pkl):**
+- `models/Logistic_Regression.pkl`, `models/Random_Forest.pkl`, etc.
+- `models/speaker_Random_Forest.pkl`, `models/speaker_SVM.pkl`, etc.
+- `models/scaler.pkl` - StandardScaler for ML models
+- `models/speaker_scaler.pkl` - StandardScaler for speaker ML models
+
+**DL Models (.pth - PyTorch state_dict):**
+- `models/cnn_best.pth`, `models/lstm_best.pth`, `models/rnn_best.pth`
+- `models/speaker_cnn_best.pth`, `models/speaker_lstm_best.pth`, `models/speaker_rnn_best.pth`
+- Contains: model state_dict, config, label_encoder
+
+**Metadata Files:**
+- `models/best_hyperparameters.json` - ML hyperparameter tuning results (emotion)
+- `models/best_hyperparameters_speaker.json` - ML hyperparameter tuning results (speaker)
+- `models/speaker_metadata.json` - Speaker statistics and feature info
+- `models/speaker_models_metadata.pkl` - Speaker ML model metadata
+- `models/speaker_dl_metadata.json` - Speaker DL model metadata
+- `models/dl_config_emotion.json` - Last used DL config (emotion)
+- `models/dl_config_speaker.json` - Last used DL config (speaker)
 
 ## New Files and Components
 

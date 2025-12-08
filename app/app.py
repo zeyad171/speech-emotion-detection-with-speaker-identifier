@@ -322,8 +322,6 @@ with tab1:
                                 st.stop()
                         except Exception as e:
                             st.error(f"Error with {selected_model}: {e}")
-                            import traceback
-                            st.error(traceback.format_exc())
                             st.stop()
                             
                     elif model_type == "DL Models" and selected_model and emotion_dl_trainer:
@@ -375,8 +373,6 @@ with tab1:
                             
                         except Exception as e:
                             st.error(f"Error with DL model: {e}")
-                            import traceback
-                            st.error(traceback.format_exc())
                             st.stop()
                             
                     elif model_type == "Best Model" and emotion_ml_trainer:
@@ -448,8 +444,6 @@ with tab1:
                 os.unlink(tmp_path)
         except Exception as e:
             st.error(f"Error processing audio: {e}")
-            import traceback
-            st.code(traceback.format_exc())
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
 
@@ -617,8 +611,6 @@ with tab2:
                             all_probs = probabilities[0]
                         except Exception as e:
                             st.error(f"Error with DL model: {e}")
-                            import traceback
-                            st.error(traceback.format_exc())
                             st.stop()
                     elif model_type == "Best Model" and speaker_identifier:
                         # Use best ML model
@@ -808,8 +800,6 @@ with tab2:
                 os.unlink(tmp_path)
         except Exception as e:
             st.error(f"Error processing audio: {e}")
-            import traceback
-            st.code(traceback.format_exc())
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
 

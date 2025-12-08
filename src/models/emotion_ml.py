@@ -7,7 +7,8 @@ from pathlib import Path
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.impute import SimpleImputer
 from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV, RandomizedSearchCV
 import xgboost as xgb
 import joblib
@@ -60,7 +61,7 @@ def save_eval_json(results: Dict, model_name: str, labels: list = None, results_
         'labels': labels if labels is not None else [],
     }
     payload = {'meta': out_meta, 'results': out}
-    path = os.path.join(results_dir, f'evaluation_{model_name}.json')
+    path = os.path.join(results_dir, f'evaluation_emotion_ml_{model_name}.json')
     with open(path, 'w') as f:
         json.dump(payload, f, indent=2)
     print(f"Evaluation JSON saved to {path}")
@@ -77,7 +78,7 @@ def collect_evaluations_for_visualization(results_dir: str = 'results') -> Tuple
     """
     metrics = {}
     confusion_matrices = {}
-    pattern = os.path.join(results_dir, 'evaluation_*.json')
+    pattern = os.path.join(results_dir, 'evaluation_emotion_ml_*.json')
     for p in glob.glob(pattern):
         try:
             with open(p, 'r') as f:
@@ -146,14 +147,28 @@ class EmotionMLTrainer:
         
         # Default models (for quick training without tuning)
         self.models = {
-            'logistic_regression': LogisticRegression(max_iter=1000, C=1.0, random_state=42),
-            'random_forest': RandomForestClassifier(n_estimators=200, max_depth=20, random_state=42, n_jobs=-1),
-            'svm': SVC(kernel='rbf', probability=True, C=10.0, gamma='scale', random_state=42),
-            'xgboost': xgb.XGBClassifier(random_state=42, n_jobs=-1, learning_rate=0.1, max_depth=5, n_estimators=200)
+            'logistic_regression': LogisticRegression(
+                max_iter=1000, C=1.0, class_weight='balanced', random_state=42
+            ),
+            'random_forest': RandomForestClassifier(
+                n_estimators=200, max_depth=20, class_weight='balanced',
+                random_state=42, n_jobs=-1
+            ),
+            'svm': SVC(
+                kernel='rbf', probability=True, C=10.0, gamma='scale',
+                class_weight='balanced', random_state=42
+            ),
+            'xgboost': xgb.XGBClassifier(
+                random_state=42, n_jobs=-1, learning_rate=0.1,
+                max_depth=5, n_estimators=200
+            )
         }
         
         self.best_params = {}  # Store best hyperparameters
         self.scaler = StandardScaler()
+        self.imputer = SimpleImputer(strategy='mean')  # Handle NaN values
+        self.label_encoder = LabelEncoder()  # For XGBoost label encoding
+        self.label_encoder_fitted = False  # Track if encoder is fitted
         self.trained_models = {}
     
     def prepare_data(self, X: np.ndarray, y: np.ndarray, test_size: float = 0.2, 
@@ -161,14 +176,23 @@ class EmotionMLTrainer:
         """
         Prepare data for training.
         """
+        # Check for NaN values
+        nan_count = np.isnan(X).sum()
+        if nan_count > 0:
+            print(f"  Warning: Found {nan_count} NaN values in features. Replacing with mean values.")
+        
         # Split data
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_size, random_state=random_state, stratify=y
         )
         
+        # Handle NaN values (impute with mean)
+        X_train_imputed = self.imputer.fit_transform(X_train)
+        X_test_imputed = self.imputer.transform(X_test)
+        
         # Scale features
-        X_train_scaled = self.scaler.fit_transform(X_train)
-        X_test_scaled = self.scaler.transform(X_test)
+        X_train_scaled = self.scaler.fit_transform(X_train_imputed)
+        X_test_scaled = self.scaler.transform(X_test_imputed)
         
         return X_train_scaled, X_test_scaled, y_train, y_test
     
@@ -182,8 +206,17 @@ class EmotionMLTrainer:
         elif model_name == 'logistic_regression':
             # LR accepts n_jobs
             return self.base_models[model_name](random_state=42, n_jobs=-1)
+        elif model_name == 'xgboost':
+            # XGBoost requires numeric labels and multi-class objective
+            n_classes = 7  # 7 emotions
+            return self.base_models[model_name](
+                random_state=42,
+                n_jobs=-1,
+                objective='multi:softmax',
+                num_class=n_classes
+            )
         else:
-            # RF and XGB accept n_jobs
+            # RF accepts n_jobs
             return self.base_models[model_name](random_state=42, n_jobs=-1)
 
     def train_model(self, model_name: str, X_train: np.ndarray, y_train: np.ndarray, 
@@ -195,6 +228,15 @@ class EmotionMLTrainer:
             raise ValueError(f"Unknown model: {model_name}")
         
         print(f"\nTraining {model_name}...")
+        
+        # Encode labels for XGBoost (requires numeric labels)
+        if model_name == 'xgboost':
+            if not self.label_encoder_fitted:
+                self.label_encoder.fit(y_train)
+                self.label_encoder_fitted = True
+            y_train_for_model = self.label_encoder.transform(y_train)
+        else:
+            y_train_for_model = y_train
         
         # Platform-aware n_jobs for Windows compatibility
         n_jobs_value = 1 if platform.system() == 'Windows' else -1
@@ -231,7 +273,7 @@ class EmotionMLTrainer:
                     verbose=0
                 )
             
-            search.fit(X_train, y_train)
+            search.fit(X_train, y_train_for_model)
             model = search.best_estimator_
             self.best_params[model_name] = search.best_params_
             
@@ -240,14 +282,14 @@ class EmotionMLTrainer:
         else:
             # Use default model
             model = self.models[model_name]
-            model.fit(X_train, y_train)
+            model.fit(X_train, y_train_for_model)
         
         self.trained_models[model_name] = model
         
         # Cross-validation score (reduced folds for Random Forest to speed up)
         cv_folds = 3 if model_name == 'random_forest' else 5
         n_jobs_value = 1 if platform.system() == 'Windows' else -1
-        cv_scores = cross_val_score(model, X_train, y_train, cv=cv_folds, scoring='accuracy', n_jobs=n_jobs_value)
+        cv_scores = cross_val_score(model, X_train, y_train_for_model, cv=cv_folds, scoring='accuracy', n_jobs=n_jobs_value)
         
         results = {
             'model': model,
@@ -291,8 +333,6 @@ class EmotionMLTrainer:
                     results['best_model'] = model_name
             except Exception as e:
                 print(f"Error training {model_name}: {e}")
-                import traceback
-                traceback.print_exc()
         
         # Print summary
         if results['best_model']:
@@ -374,9 +414,15 @@ class EmotionMLTrainer:
                 # Best-effort: ignore incompatible params
                 print("  [WARNING] Could not apply some best_params to estimator; using estimator defaults.")
 
-        # Refit scaler on full data
+        # Handle NaN values and refit scaler on full data
+        nan_count = np.isnan(X).sum()
+        if nan_count > 0:
+            print(f"  Warning: Found {nan_count} NaN values in features. Replacing with mean values.")
+        
+        self.imputer = SimpleImputer(strategy='mean')
         self.scaler = StandardScaler()
-        X_scaled = self.scaler.fit_transform(X)
+        X_imputed = self.imputer.fit_transform(X)
+        X_scaled = self.scaler.fit_transform(X_imputed)
 
         # Fit estimator on full data
         estimator.fit(X_scaled, y)
@@ -385,11 +431,13 @@ class EmotionMLTrainer:
         final_name = f"{model_name}{save_suffix}"
         self.trained_models[final_name] = estimator
 
-        # Save model and scaler
+        # Save model, scaler, and imputer
         model_path = os.path.join(self.models_dir, f"{final_name}.pkl")
         scaler_path = os.path.join(self.models_dir, f"scaler{save_suffix}.pkl")
+        imputer_path = os.path.join(self.models_dir, f"imputer{save_suffix}.pkl")
         joblib.dump(estimator, model_path)
         joblib.dump(self.scaler, scaler_path)
+        joblib.dump(self.imputer, imputer_path)
 
         # Save metadata
         metadata = {
@@ -400,6 +448,7 @@ class EmotionMLTrainer:
             'feature_count': int(X.shape[1]) if len(X.shape) > 1 else 0,
             'saved_model': model_path,
             'saved_scaler': scaler_path,
+            'saved_imputer': imputer_path,
             'timestamp': datetime.utcnow().isoformat() + 'Z'
         }
         meta_path = os.path.join(self.models_dir, f"{final_name}_metadata.json")
@@ -408,6 +457,7 @@ class EmotionMLTrainer:
 
         print(f"Final model saved to {model_path}")
         print(f"Final scaler saved to {scaler_path}")
+        print(f"Final imputer saved to {imputer_path}")
         print(f"Metadata saved to {meta_path}\n")
 
 
@@ -518,14 +568,22 @@ def train(models_dir='models', test_size=0.2, tune_hyperparameters=True, retrain
         model = model_results['model']
         y_pred = model.predict(ml_results['X_test'])
         
+        # Decode XGBoost predictions back to string labels
+        if model_name == 'xgboost' and ml_trainer.label_encoder_fitted:
+            y_pred = ml_trainer.label_encoder.inverse_transform(y_pred.astype(int))
+        
         eval_results = evaluator.evaluate_classification(
             ml_results['y_test'], y_pred, labels=unique_labels
         )
         evaluator.print_evaluation_results(eval_results, model_name, labels=unique_labels)
+        # Save confusion matrix with unique emotion ML naming
         evaluator.plot_confusion_matrix(
-            eval_results['confusion_matrix'], unique_labels, model_name
+            eval_results['confusion_matrix'], unique_labels, model_name,
+            save_name=f'confusion_matrix_emotion_ml_{model_name}'
         )
-        evaluator.save_results(eval_results, model_name, labels=unique_labels)
+        evaluator.save_results(eval_results, f"{model_name} (Emotion - ML)",
+                             labels=unique_labels,
+                             filepath=os.path.join(evaluator.results_dir, f'evaluation_emotion_ml_{model_name}.txt'))
         # Save JSON for visualization helpers
         try:
             save_eval_json(eval_results, model_name, labels=unique_labels)
@@ -560,11 +618,19 @@ def train(models_dir='models', test_size=0.2, tune_hyperparameters=True, retrain
     print(f"Best model: {best_model} (Accuracy: {best_score:.4f})")
     print(f"{'='*60}")
 
-    # Generate overfitting detection plots (ML: train vs test)
+    
+    # Generate comprehensive visualizations
+    print(f"\n{'='*60}")
+    print("Generating comprehensive visualizations...")
+    print(f"{'='*60}")
     try:
-        viz.plot_overfitting_detection(metrics=metrics, histories=None, results_dir='results')
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+        from visualization import generate_visualizations
+        generate_visualizations()
     except Exception as e:
-        print(f"Warning: could not generate overfitting plots: {e}")
+        print(f"Warning: could not generate visualizations: {e}")
+        print(f"You can generate them manually: python src/visualization.py")
+
 
 
 if __name__ == '__main__':

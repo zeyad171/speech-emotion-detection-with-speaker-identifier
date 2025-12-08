@@ -23,23 +23,37 @@ The project uses four emotion datasets located in the `dataset/` folder:
 
 ## Installation
 
-1. Clone or download this repository
+### Prerequisites
+- Python 3.10 or higher (recommended: 3.10 or 3.11)
+- pip (Python package manager)
+- (Optional) NVIDIA GPU with CUDA 12.4 support for faster training
 
-2. Install required packages:
+### Installation Steps
+
+1. **Clone or download this repository**
+
+2. **Install required packages:**
 ```bash
 pip install -r requirements.txt
 ```
 
-   **For GPU support (recommended):**
+3. **For GPU support (recommended for deep learning):**
    ```bash
    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
    ```
    See [INSTALL_GPU_PYTORCH.md](INSTALL_GPU_PYTORCH.md) for detailed GPU setup instructions.
 
-3. (Optional) Check GPU availability:
-```bash
-python -c "import torch; print(torch.cuda.is_available())"
-```
+4. **(Optional) Verify installation:**
+   ```bash
+   # Check GPU availability
+   python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
+   
+   # Verify key libraries
+   python -c "import librosa, sklearn, streamlit; print('All libraries loaded successfully')"
+   ```
+
+5. **(If needed) Handle LLVM/NumPy issues:**
+   If you encounter LLVM symbol errors, the code handles this automatically. See [Troubleshooting](#troubleshooting) for details.
 
 ## Quick Start
 
@@ -129,22 +143,27 @@ project/
 ├── dataset/                 # Dataset folders (TESS, SAVEE, RAVDESS, CREMA)
 ├── src/
 │   ├── data_loader.py      # Dataset loading and preprocessing
-│   ├── feature_extraction.py  # Feature extraction
-│   ├── models/
-│   │   ├── ml_models.py    # Traditional ML models
-│   │   ├── dl_models.py   # Deep learning models
-│   │   ├── speaker_ml.py   # Speaker identification ML models
-│   │   └── speaker_dl.py   # Speaker identification DL models
-│   ├── evaluation.py       # Evaluation metrics
-│   └── utils.py            # Utility functions
-├── models/                  # Saved models and features
+│   ├── feature_extraction.py  # Feature extraction (65 features)
+│   ├── evaluation.py       # Model evaluation metrics
+│   ├── utils.py            # Utility functions (caching, saving/loading)
+│   ├── visualization.py    # Visualization helpers (plots, comparisons)
+│   └── models/
+│       ├── emotion_ml.py   # Emotion detection ML models + training
+│       ├── emotion_dl.py   # Emotion detection DL models + training
+│       ├── speaker_ml.py   # Speaker identification ML + training
+│       ├── speaker_dl.py   # Speaker identification DL + training
+│       └── dl_param_config.py  # DL parameter configuration helper
+├── scripts/
+│   └── generate_dl_config.py  # DL config generator script
+├── models/                  # Saved models, features, and cache files
 ├── results/                 # Evaluation results and plots
 ├── app/
-│   └── app.py             # Streamlit web interface
+│   └── app.py             # Streamlit web interface (multi-tab)
 ├── notebooks/              # Jupyter notebooks for exploration
-├── main.py                 # Main entry point (explore & train modes)
+├── main.py                 # Main CLI entry point
 ├── requirements.txt        # Python dependencies
-└── README.md              # This file
+├── README.md              # This file (user documentation)
+└── PROJECT_DOCUMENTATION.md  # Technical documentation
 ```
 
 ## Features
@@ -168,15 +187,15 @@ project/
 
 ### Models
 **Machine Learning Models:**
-- Logistic Regression (baseline)
-- Random Forest
-- Support Vector Machine (SVM)
-- XGBoost
+- Logistic Regression (baseline with L2 regularization)
+- Random Forest (100-200 estimators, optimized for speed)
+- Support Vector Machine (SVM with RBF kernel, probability estimates enabled)
+- XGBoost (gradient boosting with hyperparameter tuning)
 
-**Deep Learning Models:**
-- CNN (for spectrograms) - Integrated in training pipeline
-- LSTM (for sequences) - Integrated in training pipeline
-- RNN (for sequences) - Integrated in training pipeline
+**Deep Learning Models (PyTorch):**
+- **CNN** - 4 convolutional layers (32→64→128→256 filters) with batch normalization, for mel spectrograms (128×128)
+- **LSTM** - Bidirectional multi-layer LSTM (256→128 hidden units) for MFCC sequences
+- **RNN** - Multi-layer RNN (256→128 hidden units) for MFCC sequences, simpler and faster than LSTM
 
 ## Evaluation Metrics
 
@@ -209,6 +228,28 @@ Evaluation results are saved in the `results/` directory:
 - **GPU**: NVIDIA GPU recommended for faster training (RTX 20xx series or newer)
 
 ## Troubleshooting
+
+### LLVM Symbol Error (NumPy/Intel MKL)
+
+**Error:** `LLVM ERROR: Symbol not found: __svml_cosf8_ha` or similar LLVM symbol errors.
+
+**Cause:** This is a known issue with NumPy's Intel MKL library and certain CPU features (AVX-512).
+
+**Solution:** The project automatically handles this by setting environment variables before importing NumPy in `src/feature_extraction.py`. However, if you still encounter issues:
+
+```bash
+# Windows PowerShell
+$env:NPY_DISABLE_CPU_FEATURES="AVX512F,AVX512CD,AVX512_SKX"
+$env:OPENBLAS_NUM_THREADS="1"
+python main.py --mode train
+
+# Linux/Mac
+export NPY_DISABLE_CPU_FEATURES="AVX512F,AVX512CD,AVX512_SKX"
+export OPENBLAS_NUM_THREADS="1"
+python main.py --mode train
+```
+
+**Note:** These environment variables are automatically set in the code, but you can set them manually if needed. This may slightly reduce numerical performance but ensures stability.
 
 ### Import Errors
 If you get import errors, make sure all packages are installed:

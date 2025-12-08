@@ -577,8 +577,6 @@ class SpeakerDLTrainer:
             results['models']['cnn'] = {'model': cnn, 'history': hist}
         except Exception as e:
             print(f"CNN Failed: {e}")
-            import traceback
-            traceback.print_exc()
 
         # Train LSTM
         try:
@@ -586,8 +584,6 @@ class SpeakerDLTrainer:
             results['models']['lstm'] = {'model': lstm, 'history': hist}
         except Exception as e:
             print(f"LSTM Failed: {e}")
-            import traceback
-            traceback.print_exc()
         
         # Train RNN
         try:
@@ -602,8 +598,6 @@ class SpeakerDLTrainer:
             results['models']['rnn'] = {'model': rnn_model, 'history': hist}
         except Exception as e:
             print(f"RNN Failed: {e}")
-            import traceback
-            traceback.print_exc()
             
         return results
     
@@ -611,7 +605,7 @@ class SpeakerDLTrainer:
         if model_type not in self.trained_models:
             raise ValueError(f"Model {model_type} not trained yet")
         
-        filepath = os.path.join(self.models_dir, f'speaker_{model_type}.pth')
+        filepath = os.path.join(self.models_dir, f'speaker_dl_{model_type}.pth')
         
         save_dict = {
             'model_state_dict': self.trained_models[model_type].state_dict(),
@@ -971,16 +965,17 @@ def train(models_dir='models', test_size=0.2, validation_size=0.1, random_state=
         
         print(f"    Saving confusion matrix...")
         evaluator.plot_confusion_matrix(
-            eval_results['confusion_matrix'], present_speakers, f"{model_type.upper()}_speaker"
+            eval_results['confusion_matrix'], present_speakers, f"{model_type.upper()}_speaker",
+            save_name=f'confusion_matrix_speaker_dl_{model_type}'
         )
         
         print(f"    Saving results...")
-        # Add _speaker suffix to filename and Speaker ID to header
-        model_save_name = f"{model_type.upper()} (Speaker ID)"
+        # Add speaker_dl prefix to filename
+        model_save_name = f"{model_type.upper()} (Speaker ID - DL)"
         evaluator.save_results(
             eval_results, 
             model_save_name, 
-            filepath=os.path.join(evaluator.results_dir, f'evaluation_{model_type.upper()}_speaker.txt'),
+            filepath=os.path.join(evaluator.results_dir, f'evaluation_speaker_dl_{model_type}.txt'),
             labels=present_speakers
         )
         
