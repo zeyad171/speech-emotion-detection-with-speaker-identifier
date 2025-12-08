@@ -24,6 +24,62 @@ from src.data_loader import EmotionDatasetLoader
 from src.speaker_feature_extraction import SpeakerFeatureExtractor  # Speaker-optimized features
 from src.evaluation import ModelEvaluator
 from src.utils import save_features, load_features, save_preprocessed_audio, load_preprocessed_audio
+import glob
+import src.visualization as viz
+
+
+def _make_json_serializable(o):
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    if isinstance(o, (np.integer, np.floating)):
+        return o.item()
+    return o
+
+
+def save_eval_json(results: Dict, model_name: str, labels: list = None, results_dir: str = 'results') -> str:
+    """
+    Save an evaluator results dict as JSON for visualization.
+    """
+    os.makedirs(results_dir, exist_ok=True)
+    out = {}
+    for k, v in results.items():
+        try:
+            out[k] = _make_json_serializable(v)
+        except Exception:
+            out[k] = str(v)
+
+    payload = {
+        'meta': {'model_name': model_name, 'labels': labels or []},
+        'results': out
+    }
+    path = os.path.join(results_dir, f'evaluation_{model_name}.json')
+    with open(path, 'w') as f:
+        json.dump(payload, f, indent=2)
+    print(f"Evaluation JSON saved to {path}")
+    return path
+
+
+def collect_evaluations_for_visualization(results_dir: str = 'results') -> Tuple[Dict[str, Dict], Dict[str, np.ndarray]]:
+    metrics = {}
+    confusion_matrices = {}
+    for p in glob.glob(os.path.join(results_dir, 'evaluation_*.json')):
+        try:
+            with open(p, 'r') as f:
+                payload = json.load(f)
+            model_name = payload.get('meta', {}).get('model_name') or Path(p).stem.replace('evaluation_', '')
+            results = payload.get('results', {})
+            metrics[model_name] = {
+                'accuracy': float(results.get('accuracy', np.nan)),
+                'f1_macro': float(results.get('f1_macro', np.nan)),
+                'f1_micro': float(results.get('f1_micro', np.nan)),
+                'f1_weighted': float(results.get('f1_weighted', np.nan))
+            }
+            cm = results.get('confusion_matrix')
+            if cm is not None:
+                confusion_matrices[model_name] = np.array(cm)
+        except Exception as e:
+            print(f"Warning: failed to load {p}: {e}")
+    return metrics, confusion_matrices
 
 
 class SpeakerMLTrainer:
@@ -36,6 +92,40 @@ class SpeakerMLTrainer:
         self.models_dir = models_dir
         os.makedirs(models_dir, exist_ok=True)
         
+        # Base class references (will be instantiated during tuning)
+        self.base_models = {
+            'logistic_regression': LogisticRegression,
+            'random_forest': RandomForestClassifier,
+            'svm': SVC,
+            'xgboost': xgb.XGBClassifier
+        }
+
+        # Hyperparameter grids for tuning (kept conservative for speaker ID)
+        self.param_grids = {
+            'logistic_regression': {
+                'C': [0.01, 0.1, 1.0, 10.0],
+                'max_iter': [1000]
+            },
+            'random_forest': {
+                'n_estimators': [100, 200],
+                'max_depth': [10, 20, None],
+                'min_samples_split': [2, 5]
+            },
+            'svm': {
+                'C': [0.1, 1.0, 10.0],
+                'gamma': ['scale', 'auto'],
+                'kernel': ['rbf']
+            },
+            'xgboost': {
+                'learning_rate': [0.01, 0.1],
+                'max_depth': [3, 6],
+                'n_estimators': [100, 200]
+            }
+        }
+
+        # Store best params when tuning
+        self.best_params = {}
+
         # Initialize multiple ML models
         # Note: SVC with probability=True can be very slow for many speakers
         self.models = {
@@ -80,8 +170,20 @@ class SpeakerMLTrainer:
         
         return X_train_scaled, X_test_scaled, y_train, y_test
     
+    def _get_base_estimator(self, model_name: str):
+        """
+        Instantiate a base estimator for tuning with sensible defaults.
+        """
+        if model_name == 'svm':
+            return self.base_models[model_name](random_state=42, probability=True)
+        elif model_name == 'logistic_regression':
+            return self.base_models[model_name](random_state=42, n_jobs=-1, max_iter=1000)
+        else:
+            return self.base_models[model_name](random_state=42, n_jobs=-1)
+
+
     def train_model(self, model_name: str, X_train: np.ndarray, y_train: np.ndarray, 
-                    X_test: np.ndarray, y_test: np.ndarray) -> Dict:
+                    X_test: np.ndarray, y_test: np.ndarray, tune_hyperparameters: bool = False) -> Dict:
         """
         Train a single model.
         """
@@ -89,27 +191,67 @@ class SpeakerMLTrainer:
             raise ValueError(f"Unknown model: {model_name}")
         
         print(f"\nTraining {model_name}...")
-        model = self.models[model_name]
-        
-        # Train model
-        model.fit(X_train, y_train)
-        self.trained_models[model_name] = model
-        
-        # Evaluate
-        y_pred = model.predict(X_test)
-        
-        accuracy = accuracy_score(y_test, y_pred)
-        
-        results = {
-            'model': model,
-            'accuracy': accuracy,
-            'y_pred': y_pred,
-            'cv_mean': 0.0,
-            'top3_accuracy': 0.0,
-            'top5_accuracy': 0.0
-        }
+
+        # Platform-aware n_jobs
+        n_jobs_value = 1 if platform.system() == 'Windows' else -1
+
+        if tune_hyperparameters and model_name in self.param_grids:
+            print(f"  Tuning hyperparameters for {model_name}...")
+            estimator = self._get_base_estimator(model_name)
+
+            # Use RandomizedSearchCV for heavier models
+            if model_name in ['svm', 'xgboost', 'random_forest']:
+                n_iter = 12
+                cv_folds = 3
+                search = RandomizedSearchCV(
+                    estimator=estimator,
+                    param_distributions=self.param_grids[model_name],
+                    n_iter=n_iter,
+                    cv=cv_folds,
+                    scoring='accuracy',
+                    n_jobs=n_jobs_value,
+                    random_state=42,
+                    verbose=0
+                )
+            else:
+                search = GridSearchCV(
+                    estimator=estimator,
+                    param_grid=self.param_grids[model_name],
+                    cv=3,
+                    scoring='accuracy',
+                    n_jobs=n_jobs_value,
+                    verbose=0
+                )
+
+            search.fit(X_train, y_train)
+            model = search.best_estimator_
+            self.best_params[model_name] = search.best_params_
+            print(f"  Best parameters: {search.best_params_}")
+            print(f"  Best CV score: {search.best_score_:.4f}")
+        else:
+            model = self.models[model_name]
+            model.fit(X_train, y_train)
+            self.trained_models[model_name] = model
+
+            # Evaluate
+            y_pred = model.predict(X_test)
+
+            accuracy = accuracy_score(y_test, y_pred)
+
+            results = {
+                'model': model,
+                'accuracy': accuracy,
+                'y_pred': y_pred,
+                'cv_mean': 0.0,
+                'top3_accuracy': 0.0,
+                'top5_accuracy': 0.0
+            }
 
         # Calculate Probabilities and Top-K (Only if applicable)
+        # If tuning was performed and model wasn't added yet, ensure trained_models updated
+        if model_name not in self.trained_models:
+            self.trained_models[model_name] = model
+
         if hasattr(model, "predict_proba"):
             y_pred_proba = model.predict_proba(X_test)
             results['y_pred_proba'] = y_pred_proba
@@ -129,18 +271,19 @@ class SpeakerMLTrainer:
         
         # Cross-validation score (Skip for heavy models if needed)
         if model_name != 'svm': 
-            cv_scores = cross_val_score(model, X_train, y_train, cv=3, scoring='accuracy', n_jobs=-1)
+            cv_jobs = 1 if platform.system() == 'Windows' else -1
+            cv_scores = cross_val_score(model, X_train, y_train, cv=3, scoring='accuracy', n_jobs=cv_jobs)
             results['cv_mean'] = cv_scores.mean()
             results['cv_std'] = cv_scores.std()
             print(f"  CV Accuracy: {results['cv_mean']:.4f}")
         
-        print(f"  Accuracy: {accuracy:.4f}")
+        print(f"  Accuracy: {results.get('accuracy', accuracy):.4f}")
         if results['top3_accuracy'] > 0:
             print(f"  Top-3 Accuracy: {results['top3_accuracy']:.4f}")
         
         return results
     
-    def train_all_models(self, X: np.ndarray, y: np.ndarray, test_size: float = 0.2) -> Dict:
+    def train_all_models(self, X: np.ndarray, y: np.ndarray, test_size: float = 0.2, tune_hyperparameters: bool = False) -> Dict:
         """
         Train all ML models and select best performer.
         """
@@ -158,7 +301,7 @@ class SpeakerMLTrainer:
         # Train each model
         for model_name in self.models.keys():
             try:
-                model_results = self.train_model(model_name, X_train, y_train, X_test, y_test)
+                model_results = self.train_model(model_name, X_train, y_train, X_test, y_test, tune_hyperparameters=tune_hyperparameters)
                 results['models'][model_name] = model_results
                 
                 # Track best model (based on accuracy)
@@ -180,7 +323,69 @@ class SpeakerMLTrainer:
                 print(f"{model_name:20s} Accuracy: {model_results['accuracy']:.4f}{marker}")
             print("="*60)
         
+        # Save scaler
+        joblib.dump(self.scaler, os.path.join(self.models_dir, 'scaler_speakers.pkl'))
+
+        # Save best parameters if tuning was performed
+        if tune_hyperparameters and self.best_params:
+            params_file = os.path.join(self.models_dir, 'best_hyperparameters_speaker.json')
+            # Convert numpy types to native Python types for JSON serialization
+            params_serializable = {}
+            for k, v in self.best_params.items():
+                params_serializable[k] = {k2: (float(v2) if isinstance(v2, (np.integer, np.floating)) else v2) for k2, v2 in v.items()}
+            with open(params_file, 'w') as f:
+                json.dump(params_serializable, f, indent=2)
+            print(f"\nBest hyperparameters saved to {params_file}")
+
         return results
+
+    def retrain_on_full_data(self, model_name: str, X: np.ndarray, y: np.ndarray, save_suffix: str = '_final'):
+        """
+        Retrain the selected speaker model on the full dataset (no train/test split).
+        """
+        if model_name not in self.models:
+            raise ValueError(f"Unknown model for retraining: {model_name}")
+
+        print(f"\nRetraining {model_name} on full dataset ({len(X)} samples)...")
+
+        estimator = self._get_base_estimator(model_name)
+        if model_name in self.best_params:
+            try:
+                estimator.set_params(**self.best_params[model_name])
+            except Exception:
+                print("  [WARNING] Could not apply some best_params to estimator; using estimator defaults.")
+
+        # Refit scaler on full data
+        self.scaler = StandardScaler()
+        X_scaled = self.scaler.fit_transform(X)
+
+        estimator.fit(X_scaled, y)
+
+        final_name = f"{model_name}{save_suffix}"
+        self.trained_models[final_name] = estimator
+
+        model_path = os.path.join(self.models_dir, f"{final_name}.pkl")
+        scaler_path = os.path.join(self.models_dir, f"scaler_speakers{save_suffix}.pkl")
+        joblib.dump(estimator, model_path)
+        joblib.dump(self.scaler, scaler_path)
+
+        metadata = {
+            'model_name': final_name,
+            'base_model': model_name,
+            'best_params': self.best_params.get(model_name, {}),
+            'training_samples': int(len(X)),
+            'feature_count': int(X.shape[1]) if len(X.shape) > 1 else 0,
+            'saved_model': model_path,
+            'saved_scaler': scaler_path,
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        }
+        meta_path = os.path.join(self.models_dir, f"{final_name}_metadata.json")
+        with open(meta_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+
+        print(f"Final model saved to {model_path}")
+        print(f"Final scaler saved to {scaler_path}")
+        print(f"Metadata saved to {meta_path}\n")
     
     def predict(self, X: np.ndarray, model_name: str = None) -> Tuple[np.ndarray, np.ndarray]:
         """Predict speaker from features."""
@@ -444,6 +649,7 @@ def train(models_dir='models', test_size=0.2):
     
     best_model = None
     best_score = 0
+    metrics = {}
     
     for model_name, model_results in ml_results['models'].items():
         y_pred = model_results['y_pred']
@@ -467,6 +673,20 @@ def train(models_dir='models', test_size=0.2):
             filepath=os.path.join(evaluator.results_dir, f'evaluation_speaker_ml_{model_name}.txt'),
             labels=present_speakers
         )
+        # Save JSON for visualization
+        try:
+            save_eval_json(eval_results, model_name, labels=present_speakers)
+        except Exception:
+            pass
+
+        # Collect simple train/test metrics
+        try:
+            metrics[model_name] = {
+                'cv_mean': float(model_results.get('cv_mean', np.nan)),
+                'test': float(eval_results.get('accuracy', np.nan))
+            }
+        except Exception:
+            metrics[model_name] = {'cv_mean': np.nan, 'test': np.nan}
         
         # Save JSON for potential visualization (unique name)
         try:
@@ -492,6 +712,60 @@ def train(models_dir='models', test_size=0.2):
     print(f"\n{'='*60}")
     print(f"Best model: {best_model} (Accuracy: {best_score:.4f})")
     print(f"{'='*60}")
+
+    # Generate overfitting detection plots (ML: train vs test)
+    try:
+        viz.plot_overfitting_detection(metrics=metrics, histories=None, results_dir='results')
+    except Exception as e:
+        print(f"Warning: could not generate overfitting plots: {e}")
+
+    # Save speaker metadata JSON for app visualizations
+    try:
+        # Compute per-speaker feature statistics
+        speakers_list = list(speakers)
+        features_arr = np.asarray(features)
+        speaker_to_indices = {}
+        for idx, spk in enumerate(speakers_list):
+            speaker_to_indices.setdefault(spk, []).append(idx)
+
+        meta = {
+            'speakers': {},
+            'datasets': {},
+            'feature_count': int(features_arr.shape[1]) if features_arr.ndim == 2 else 65,
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        }
+
+        # Estimate dataset source per speaker via ID pattern
+        def _detect_dataset(spk: str) -> str:
+            if spk.startswith('Actor_'):
+                return 'RAVDESS'
+            if spk.isdigit() and len(spk) == 4:
+                return 'CREMA-D'
+            if spk in ['DC', 'JE', 'JK', 'KL']:
+                return 'SAVEE'
+            return 'TESS'
+
+        for spk, idxs in speaker_to_indices.items():
+            spk_feats = features_arr[idxs]
+            # Aggregate stats
+            meta['speakers'][spk] = {
+                'id': spk,
+                'num_samples': int(len(idxs)),
+                'feature_mean': np.mean(spk_feats, axis=0).tolist(),
+                'feature_std': np.std(spk_feats, axis=0).tolist(),
+                'feature_min': np.min(spk_feats, axis=0).tolist(),
+                'feature_max': np.max(spk_feats, axis=0).tolist(),
+                'dataset': _detect_dataset(spk)
+            }
+            ds = meta['speakers'][spk]['dataset']
+            meta['datasets'][ds] = meta['datasets'].get(ds, 0) + int(len(idxs))
+
+        out_path = os.path.join(models_dir, 'speaker_metadata.json')
+        with open(out_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+        print(f"Speaker metadata saved to {out_path}")
+    except Exception as e:
+        print(f"Warning: could not save speaker metadata: {e}")
 
 
 if __name__ == '__main__':

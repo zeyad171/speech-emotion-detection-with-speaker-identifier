@@ -1,0 +1,39 @@
+{
+  "meta": {
+    "model_name": "rf_emotion_test",
+    "labels": [
+      "angry",
+      "happy",
+      "neutral"
+    ]
+  },
+  "results": {
+    "accuracy": 0.78,
+    "f1_macro": 0.75,
+    "f1_micro": 0.78,
+    "f1_weighted": 0.77,
+    "f1_per_class": [
+      0.8,
+      0.7,
+      0.75
+    ],
+    "confusion_matrix": [
+      [
+        50,
+        5,
+        3
+      ],
+      [
+        6,
+        40,
+        4
+      ],
+      [
+        5,
+        3,
+        45
+      ]
+    ],
+    "classification_report": {}
+  }
+}
