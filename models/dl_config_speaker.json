@@ -1,0 +1,48 @@
+{
+  "epochs": 50,
+  "batch_size": 512,
+  "learning_rate": 0.001,
+  "weight_decay": 1e-05,
+  "optimizer": "adamw",
+  "scheduler": "reduce_on_plateau",
+  "scheduler_patience": 5,
+  "early_stopping_patience": 8,
+  "seed": 42,
+  "in_channels": 1,
+  "dropout": 0.4,
+  "hidden_size": 128,
+  "num_layers": 2,
+  "finetune_head_epochs": 5,
+  "finetune_full_epochs": 25,
+  "head_lr": 0.001,
+  "full_finetune_lr": 0.0001,
+  "freeze_backbone": true,
+  "freeze_backbone_until_epoch": 5,
+  "augment_spec_augment": true,
+  "augment_noise": false,
+  "noise_level": 0.005,
+  "num_workers": 0,
+  "device": null,
+  "notes": "",
+  "cnn_finetune": {
+    "freeze_backbone": true,
+    "finetune_head_epochs": 5,
+    "finetune_full_epochs": 25,
+    "head_lr": 0.001,
+    "full_finetune_lr": 0.0001
+  },
+  "lstm_finetune": {
+    "freeze_backbone": true,
+    "finetune_head_epochs": 5,
+    "finetune_full_epochs": 40,
+    "head_lr": 0.0001,
+    "full_finetune_lr": 0.0001
+  },
+  "rnn_finetune": {
+    "freeze_backbone": true,
+    "finetune_head_epochs": 5,
+    "finetune_full_epochs": 30,
+    "head_lr": 0.001,
+    "full_finetune_lr": 0.0001
+  }
+}

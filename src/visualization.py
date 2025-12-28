@@ -8,6 +8,11 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import json
 import os
+import seaborn as sns
+
+# Optional sklearn helpers used for calibration and embedding visualization
+from sklearn.calibration import calibration_curve
+from sklearn.manifold import TSNE
 
 sns.set_style("whitegrid")
 plt.rcParams['figure.dpi'] = 150

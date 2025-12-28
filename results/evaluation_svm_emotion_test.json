@@ -1,0 +1,39 @@
+{
+  "meta": {
+    "model_name": "svm_emotion_test",
+    "labels": [
+      "angry",
+      "happy",
+      "neutral"
+    ]
+  },
+  "results": {
+    "accuracy": 0.82,
+    "f1_macro": 0.8,
+    "f1_micro": 0.82,
+    "f1_weighted": 0.81,
+    "f1_per_class": [
+      0.85,
+      0.78,
+      0.77
+    ],
+    "confusion_matrix": [
+      [
+        55,
+        2,
+        1
+      ],
+      [
+        4,
+        42,
+        4
+      ],
+      [
+        3,
+        2,
+        48
+      ]
+    ],
+    "classification_report": {}
+  }
+}
